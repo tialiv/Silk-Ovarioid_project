@@ -1,0 +1,5 @@
+Path: "/srv/tili/trimmedFastq/sample_info.txt"
+index: "/srv/index/GRCh38.108/STAR_index"
+gtf: "/srv/index/GRCh38.108/Homo_sapiens.GRCh38.108.chr.gtf"
+target: "exon"
+rulepath: "/srv/tili/trimmedFastq"

@@ -1,0 +1,86 @@
+from snakemake.utils import min_version
+min_version("5.3.0")
+
+configfile: "config.yaml"
+
+sample_names = config["Path"]
+
+rule all:
+    input:
+        expand("{rulepath}/rulegraph.png", rulepath=config["rulepath"]),
+        expand("{name}.Aligned.sortedByCoord.out.bam", name = sample_names),
+        "all.count.txt"
+
+
+rule align_to_genome:
+    """
+    Align a fastq file to a genome index using Hisat2 and sort the bam file using samtools.
+    """
+    input:
+        index=config["index"],
+        fq1="trimmedFastq/{name}_L001_R1_001.fastq.gz",
+        fq2="trimmedFastq/{name}_L001_R2_001.fastq.gz"
+    output:
+        outdata="{name}.Aligned.sortedByCoord.out.bam",
+        log_final="{name}.Log.final.out",
+        log="{name}.Log.progress.out",
+        sj="{name}.SJ.out.tab"
+    params:
+        outprefix="{name}."
+    shell:
+        """
+        STAR --genomeDir {input.index} --runThreadN 6 --readFilesIn {input.fq1} {input.fq2} --readFilesCommand zcat --outFileNamePrefix {params.outprefix} --outSAMtype BAM SortedByCoordinate --outSAMunmapped Within
+        
+        """
+
+rule multiqc_after_alignment:
+    """
+    Aggregate all FastQC reports into a MultiQC report after alignment.
+    """
+    input:
+        expand("{name}.Log.final.out", name = sample_names)
+    output:
+        directory("/srv/tili/trimmedFastq")
+    params:
+        outdir = lambda wildcards, output: output[0]
+    shell:
+        """
+        # Run multiQC and keep the html report
+        multiqc -o {params.outdir} {input} 
+
+        # Remove the other directory that multiQC creates
+        rm -rf multiqc_data
+
+        """
+
+rule generate_count_table:
+    """
+    Generate a count table using featureCounts in subread package.
+    """
+    input:
+        inputdata=expand("{name}.Aligned.sortedByCoord.out.bam", name = sample_names),
+        gtf=config["gtf"]
+    params:
+        target=config["target"]
+    output:
+        "all.count.txt"
+    log:
+        "expression/count.log"
+    shell:
+        """
+        featureCounts -T 6 -p -t {params.target} -g gene_id -a {input.gtf} -o {output} {input.inputdata} > {log}
+
+        """
+
+rule generate_rulegraph:
+    """
+    Generate a rulegraph for the workflow.
+    """
+    output:
+        expand("{rulepath}/rulegraph.png", rulepath=config["rulepath"])       
+    shell:
+        """
+        snakemake --snakefile Snakefile1.txt --rulegraph > {output}
+
+        """
+

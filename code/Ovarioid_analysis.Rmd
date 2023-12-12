@@ -1,0 +1,2215 @@
+---
+title: "Ovarioid"
+author: "TL"
+date: "2023-01-29"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load required library
+
+```{r Load dependencies}
+suppressMessages(library(dplyr))
+suppressMessages(library(DESeq2))
+suppressMessages(library(ggplot2))
+suppressMessages(library(pheatmap))
+suppressMessages(library(umap))
+suppressMessages(library(biomaRt))
+suppressMessages(library(org.Hs.eg.db))
+suppressMessages(library(DOSE))
+suppressMessages(library(pathview))
+suppressMessages(library(clusterProfiler))
+suppressMessages(library(pheatmap))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(RColorBrewer))
+suppressMessages(library(msigdbr))
+suppressMessages(library(edgeR))
+suppressMessages(library(stringr))
+suppressMessages(library(future))
+suppressMessages(library(patchwork))
+suppressMessages(library(VennDiagram))
+suppressMessages(library(GSEABase))
+suppressMessages(library(GSVA))
+library(Seurat)
+suppressMessages(library(ComplexHeatmap))
+
+```
+
+## Merge count matrix from individual samples
+
+```{r merge count table}
+
+setwd("/Users/tianyili/Desktop/Ovarioid/data/raw_counts/")
+path <- "/Users/tianyili/Desktop/Ovarioid/data/raw_counts/"
+
+info <- read.table("/Users/tianyili/Desktop/Ovarioid/data/info.txt", header = T)
+
+counts <- list.files(path, pattern = "txt", recursive = F)
+data <- data.frame(matrix(nrow = 62649, ncol = 1))
+for (i in 1:length(counts)) {
+  assign(paste0("test", i), read.table(counts[i], header = T))
+  data <- cbind(data, get(paste0("test", i)))
+  rm(list = ls(pattern = "test"))
+}
+
+cells <- data[, -c(1, which(colnames(data) %in% c("Chr", "Start", "End", "Strand", "Length")))]
+cells <- cells[, -which(str_detect(colnames(cells), "Geneid."))]
+colnames(cells) <- gsub(".Aligned.sortedByCoord.out.bam", "", colnames(cells))
+
+re_name <- function(cells) {
+  gene <- cells[,1]
+  rownames(cells) <- gene
+  cells <- cells[,-1]
+  return(cells)
+}
+
+cells <- re_name(cells)
+
+d1 <- read.table("/Users/tianyili/Desktop/Ovarioid/data/BEAid_sample_name.txt", header = T)
+d2 <- read.table("/Users/tianyili/Desktop/Ovarioid/data/F.Fagerstrom_22_07_sample_info.txt", header = T)
+d2$NGI_ID <- paste0(d2$NGI_ID, "_S", rownames(d2))
+d3 <- merge(d1, d2, by.x = "BEA_ID", by.y = "User_ID")
+info <- merge(info, d3, by.x = "name", by.y = "NGI_ID")
+info <- info %>% mutate(culture = ifelse(str_detect(Customer_ID, "TIS"), "Tissue",
+                                      ifelse(str_detect(Customer_ID, "3D"), "3D", "2D"))) %>% 
+  mutate(type = ifelse(str_detect(Customer_ID, "COR"), "Cortex", "Medulla")) %>% 
+  mutate(freezing = ifelse(str_detect(Customer_ID, "SF"), "SF", "Fresh"))
+info$group <- str_sub(info$Customer_ID, end = -3)
+info$group <- gsub("_$", "", info$group)
+
+re_order <- function(info, cells) {
+  genomic_idx <- match(info$name, colnames(cells))
+  genomic_idx
+  cells <- cells[ ,genomic_idx]
+  all(info$name == colnames(cells))
+  return(cells)
+}
+
+cells <- re_order(info, cells)
+
+```
+
+## Create dds object
+
+```{r dds object construction}
+
+# correct information with freezing status
+info$freezing[c(1,2,5,6,7)] <- rep("Fresh", 5)
+
+# remove outliers
+info <- info %>% filter(name != "P28012_1071_S71")
+
+cells <- re_order(info, cells)
+info$culture <- factor(info$culture)
+info$type <- factor(info$type)
+info$freezing <- factor(info$freezing)
+info$time <- factor(info$time)
+
+# Add culture time info
+info$time <- ifelse(str_detect(info$group, "X071"), "6_weeks", 
+                    ifelse(str_detect(info$group, "Z723"), "6_weeks", "4_weeks"))
+info$time[which(str_detect(info$culture, "Tissue"))] <- rep("Fresh", 29)
+
+dds <- DESeqDataSetFromMatrix(countData=cells, colData = info, design = ~ freezing + type + culture)
+
+dds <- collapseReplicates(dds, groupby = dds$group, renameCols = T)
+
+info <- dds@colData %>% as.data.frame()
+cells <- dds@assays@data$counts %>% as.data.frame()
+
+```
+
+## Split dataset into cortex and medulla
+
+```{r split dataset}
+
+culture <- c("2D", "3D")
+freezing <- c("Fresh", "SF")
+type <- c("Cortex", "Medulla")
+
+for (i in type) {
+    info_chemical <- info %>% dplyr::filter(type == i) 
+    write.csv(info_chemical, file = paste("/Users/tianyili/Desktop/Ovarioid/data/processed/info_",i,".csv", sep = ""))
+    cells_ordered <- re_order(info_chemical, cells)
+    write.csv(cells_ordered, file = paste("/Users/tianyili/Desktop/Ovarioid/data/processed/cells_",i,".csv", sep = ""))
+}
+
+dataset <- vector(mode = "list", length = 0)
+for (i in type) {
+    print(i)
+    files <- paste0("/Users/tianyili/Desktop/Ovarioid/data/processed/info_",i,".csv")
+    info2 <- read.csv(file = files, sep = ";")
+    info2$culture <- as.factor(info2$culture)
+    info2$freezing <- as.factor(info2$freezing)
+    info2$time <- as.factor(info2$time)
+    info2$culture <- relevel(info2$culture, ref = "Tissue")
+    files_cells <- paste0("/Users/tianyili/Desktop/Ovarioid/data/processed/cells_",i,".csv")
+    cells2 <- read.delim(file = files_cells, sep = ",")
+    cells2 <- re_name(cells2)
+    print(all(info2$name == colnames(cells2)))
+    dataset[[paste0("dds_", i)]] <- DESeqDataSetFromMatrix(countData=cells2, colData = info2, design = ~ freezing + culture)
+}
+
+```
+
+
+## Plot sample counts
+
+```{r filter}
+
+theme <- theme(text=element_text(size=9),
+               axis.text.x=element_text(color="black", angle = 90),
+               axis.text.y=element_text(color="black"),
+               axis.ticks=element_blank(),
+               strip.background = element_rect(colour=NA, fill=NA),
+               plot.background = element_blank(),
+               panel.grid.major = element_blank(),
+               panel.grid.minor = element_blank(),
+               panel.border = element_blank(),
+               axis.line.x = element_line(linewidth=0.4),
+               axis.line.y = element_line(linewidth=0.4),
+               panel.background = element_blank(),
+               legend.position = "bottom")
+
+info <- read.csv2("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+info %>% mutate(read = colSums(counts(dataset[["dds_Cortex"]]))) %>%
+            ggplot(aes(x=name, y=read, fill = culture)) + geom_bar(stat = "identity") + theme +
+            ggtitle("Samples Sequenced Read") + xlab("") 
+
+```
+
+## PCA plot with cpm normalization
+
+```{r PCA cpm}
+
+# Medulla
+info <- read.csv2("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Medulla.csv", sep = ";")
+info$culture <- relevel(factor(info$culture), ref = "Tissue")
+r <- edgeR::cpm(counts(dataset[["dds_Medulla"]]), normalized.lib.sizes = T, log = T)
+pca <- prcomp(t(r))
+df <- cbind(info, pca$x)
+contri <- round(summary(pca)$importance[2,] * 100, 2)
+ggplot(df, aes(label = Customer_ID)) + geom_point(aes(x=PC1, y = PC2, color = culture), size = 3) + theme +
+      ggtitle(paste0("PCA (cpm) - Medulla")) + scale_color_manual(values = c("#2b6a99","#f16c23","#1b7c3d")) +
+      xlab(sprintf("PC1 (%s%%)", contri[1])) + ylab(sprintf("PC2 (%s%%)", contri[2])) +
+  stat_ellipse(aes(PC1, PC2, color = culture))
+
+
+# Cortex
+info <- read.csv2("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+info$culture <- relevel(factor(info$culture), ref = "Tissue")
+r <- edgeR::cpm(counts(dataset[["dds_Cortex"]]), normalized.lib.sizes = T, log = T)
+pca <- prcomp(t(r))
+df <- cbind(info, pca$x)
+contri <- round(summary(pca)$importance[2,] * 100, 2)
+ggplot(df, aes(label = Customer_ID)) + geom_point(aes(x=PC1, y = PC2, color = culture), size = 3) + theme +
+      ggtitle(paste0("PCA (cpm) - Cortex")) + scale_color_manual(values = c("#2b6a99","#f16c23","#1b7c3d")) +
+      xlab(sprintf("PC1 (%s%%)", contri[1])) + ylab(sprintf("PC2 (%s%%)", contri[2])) +
+  stat_ellipse(aes(PC1, PC2, color = culture))
+
+
+```
+
+## Difference between fresh and frozen ovarioid
+
+```{r fresh vs frozen 3D}
+
+# Keep genes that have at least 1 read and expressed in at least 5 samples
+for(i in 1:length(dataset)){
+  print(names(dataset)[i])
+  keep <- rowSums(counts(dataset[[i]]) > 1) >= 5
+  dataset[[i]] <- dataset[[i]][keep,]
+}
+
+# Relevel to set the reference as fresh tissue and perform DE analysis
+for(i in 1:length(dataset)){
+  print(names(dataset)[i])
+  dataset[[i]]$culture <- relevel(dataset[[i]]$culture, ref = "Tissue")
+  dataset[[i]] <- DESeq(dataset[[i]])
+}
+
+# Compare 2D and 3D vs Tissue
+comparisonALL <- list()
+for(i in type) {
+    files <- paste0("/Users/tianyili/Desktop/Ovarioid/data/processed/info_", i, ".csv")
+    info <- read.csv(file = files, sep = ";")
+    info$culture <- as.factor(info$culture)
+    for (j in culture) {
+        comparisonALL[[paste0(i, "_", j, "_vs_Tissue")]] <- results(dataset[[paste0("dds_",i)]], 
+                                    contrast = c("culture", j, "Tissue"), 
+                                    independentFiltering = T, pAdjustMethod = "fdr") %>% 
+                                    as.data.frame() %>% 
+                                    mutate(geneid = rownames(.))
+    }
+}  
+
+# Compare 3D vs 2D
+temp <- list()
+for (i in type){
+  files <- paste0("/Users/tianyili/Desktop/Ovarioid/data/processed/info_", i, ".csv")
+  info <- read.csv(file = files, sep = ";")
+  info$culture <- as.factor(info$culture)
+  info$culture <- relevel(info$culture, ref = "2D")
+  print(paste0(i, "_3D_vs_2D"))
+  temp[[paste0(i, "_3D_vs_2D")]] <- results(dataset[[paste0("dds_",i)]], 
+                                    contrast = c("culture", "3D", "2D"), 
+                                    independentFiltering = T, pAdjustMethod = "fdr") %>% 
+                                    as.data.frame() %>% 
+                                    mutate(geneid = rownames(.))
+}
+
+comparisonALL <- c(comparisonALL, temp)
+
+#significant DEG
+comparison05 <- list()
+for (i in 1:length(comparisonALL)) {
+  comparison05[[names(comparisonALL)[i]]] <- comparisonALL[[i]] %>% 
+    filter(padj<0.05) %>% 
+    filter(abs(log2FoldChange) > 2) %>% 
+    filter(baseMean > 100)
+}
+
+#get gene description
+mart <- useEnsembl(biomart = "ensembl",dataset = "hsapiens_gene_ensembl")
+output <- getBM(attributes=c("ensembl_gene_id","external_gene_name","entrezgene_id","description"), mart = mart)
+
+get_id <- function(res.sig) {
+  res.sig$geneid <- rownames(res.sig)
+  final <- merge(res.sig, output, by.x = "geneid", by.y = "ensembl_gene_id", all.x = T, all.y = F)
+  return(final)
+}
+
+final_all <- lapply(comparisonALL, function(x) {
+  x <- get_id(x)
+})
+
+final <- lapply(comparison05, function(x) {
+  x <- get_id(x)
+})
+
+openxlsx::write.xlsx(final, "/Users/tianyili/Desktop/Ovarioid/results/tables/Culture_vs_Tissue_DESeq2_padj_sig05_FC2_basemean100_20230731.xlsx")
+
+normalized_counts <- list()
+for (i in type) {
+  normalized_counts[[i]] <- counts(dataset[[paste0("dds_",i)]], normalized=T) %>% 
+  data.frame() %>%
+  tibble::rownames_to_column(var="gene") %>%
+  as_tibble() %>%
+  left_join(output, by=c("gene" = "ensembl_gene_id")) 
+ }
+
+# Cortex heatmap for slow freezing and fresh sample
+all <- c(final[["Cortex_2D_vs_Tissue"]]$geneid, final[["Cortex_3D_vs_Tissue"]]$geneid) %>% unique()
+id_c <- match(all, normalized_counts[["Cortex"]]$gene)
+id_c <- match(final[["Cortex_3D_vs_Tissue"]]$geneid, normalized_counts[["Cortex"]]$gene)
+cor_count <- normalized_counts[["Cortex"]][id_c,] 
+
+genes_c <- cor_count[,(ncol(cor_count)-2)]
+cor_df <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+
+scalecor <- scale(t(cor_count[,2:(ncol(cor_count)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+scalecor <- scalecor[!duplicated(scalecor$external_gene_name),]
+rownames(scalecor) <- scalecor$external_gene_name
+
+anno <- cor_df[,c(2, 9, 10, 11)] %>% 'rownames<-' (cor_df$name)
+anno <- anno[, -1]
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = T, show_rownames = F, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-4, 4, length.out = 90))
+
+# Medulla heatmap slow freezing and fresh
+all <- c(final[["Medulla_2D_vs_Tissue"]]$geneid, final[["Medulla_3D_vs_Tissue"]]$geneid) %>% unique()
+id_m <- match(all, normalized_counts[["Medulla"]]$gene)
+id_m <- match(final[["Medulla_3D_vs_Tissue"]]$geneid, normalized_counts[["Medulla"]]$gene)
+med_count <- normalized_counts[["Medulla"]][id_m,] 
+
+genes_m <- med_count[,(ncol(med_count)-2)]
+med_df <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Medulla.csv", sep = ";")
+
+scalemed <- scale(t(med_count[,2:(ncol(med_count)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+scalemed <- scalemed[!duplicated(scalemed$external_gene_name),]
+rownames(scalemed) <- scalemed$external_gene_name
+
+anno <- med_df[,c(2, 9, 10, 11)] %>% 'rownames<-' (med_df$name)
+anno <- anno[, -1]
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = T, show_rownames = F, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-4, 4, length.out = 90))
+```
+
+## Top500 DEGs with all the samples heatmap
+
+```{r top500 DEGs heatmap}
+
+# Cortex
+all <- rbind(final[[1]], final[[2]]) %>% arrange(desc(baseMean))
+top500_c <- all[1:1000,] %>% select(geneid, external_gene_name) %>% unique()
+top500_c <- top500_c[1:500,]
+
+df <- normalized_counts[["Cortex"]]
+id_c <- match(top500_c$external_gene_name, df$external_gene_name)
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+anno$culture <- factor(anno$culture, levels = c("Tissue", "2D", "3D"))
+
+Heatmap(as.matrix(scalecor[, -ncol(scalecor)]), name = "Z-score",
+        cluster_rows = T,
+        show_row_names = F,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        column_split = anno$culture,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+##### Medulla
+all <- rbind(final[[3]], final[[4]]) %>% arrange(desc(baseMean))
+top500_m <- all[1:1000,] %>% select(geneid, external_gene_name) %>% unique()
+top500_m <- top500_m[1:500,]
+
+df <- normalized_counts[["Medulla"]]
+id_m <- match(top500_m$external_gene_name, df$external_gene_name)
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+anno$culture <- factor(anno$culture, levels = c("Tissue", "2D", "3D"))
+
+Heatmap(as.matrix(scalemed[, -ncol(scalemed)]), name = "Z-score",
+        cluster_rows = T,
+        show_row_names = F,
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        column_split = anno$culture,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## Cytokine heatmap
+
+```{r cytokine heatmap}
+
+cyto <- c("ENSG00000136244", "ENSG00000169429", "ENSG00000108691", "ENSG00000107562", "ENSG00000275302",
+          "ENSG00000172156", "ENSG00000277632", "ENSG00000136689", "ENSG00000110944", "ENSG00000164400", 
+          "ENSG00000136634")
+
+# Cortex cytokine
+df <- normalized_counts[["Cortex"]]
+id_c <- match(cyto, df$gene) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+d1 <- d1[!duplicated(d1$external_gene_name),]
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Cortex")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$name)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "2D") # %>% filter(type == "Cortex")
+c2D <- scalecor[,which(colnames(scalecor) %in% d5$name)]
+c2DD <- apply(c2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c2D)) %>% 
+  'colnames<-' ("2D")
+
+d6 <- anno %>% filter(culture == "3D") #%>% filter(type == "Cortex")
+c3D <- scalecor[,which(colnames(scalecor) %in% d6$name)]
+c3DD <- apply(c3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("3D")
+
+
+# Medulla cytokine
+df <- normalized_counts[["Medulla"]]
+id_m <- match(cyto, df$gene)
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+d1 <- d1[!duplicated(d1$external_gene_name),]
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 100))
+
+d7 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Medulla")
+mtis <- scalemed[,which(colnames(scalemed) %in% d7$name)]
+mtiss <- apply(mtis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(mtis)) %>% 
+  'colnames<-' ("Tissue_med")
+
+d8 <- anno %>% filter(culture == "2D") #%>% filter(type == "Medulla")
+m2D <- scalemed[,which(colnames(scalemed) %in% d8$name)]
+m2DD <- apply(m2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m2D)) %>% 
+  'colnames<-' ("2D_med")
+
+d9 <- anno %>% filter(culture == "3D") #%>% filter(type == "Medulla")
+m3D <- scalemed[,which(colnames(scalemed) %in% d9$name)]
+m3DD <- apply(m3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m3D)) %>% 
+  'colnames<-' ("3D_med")
+
+# Combine cortex and medulla but keep the z score
+con <- cbind(tiss, c2DD, c3DD, mtiss, m2DD, m3DD)
+
+anno_group <- colnames(con) %>% as.data.frame()
+anno_group$group <- rep(c("Cortex", "Medulla"), each = 3)
+
+Heatmap(as.matrix(con), name = "Z-score",
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        show_row_names = T,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+
+## Cellcycle genes heatmap
+
+```{r cell cycle genes}
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+cycle <- c(s.genes, g2m.genes)
+
+# Cortex cell cycle
+df <- normalized_counts[["Cortex"]]
+id_c <- match(cycle, df$external_gene_name)
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Cortex")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$name)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "2D") # %>% filter(type == "Cortex")
+c2D <- scalecor[,which(colnames(scalecor) %in% d5$name)]
+c2DD <- apply(c2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c2D)) %>% 
+  'colnames<-' ("2D")
+
+d6 <- anno %>% filter(culture == "3D") #%>% filter(type == "Cortex")
+c3D <- scalecor[,which(colnames(scalecor) %in% d6$name)]
+c3DD <- apply(c3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("3D")
+
+# Medulla
+df <- normalized_counts[["Medulla"]]
+id_m <- match(cycle, df$external_gene_name)
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d7 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Medulla")
+mtis <- scalemed[,which(colnames(scalemed) %in% d7$name)]
+mtiss <- apply(mtis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(mtis)) %>% 
+  'colnames<-' ("Tissue_med")
+
+d8 <- anno %>% filter(culture == "2D") #%>% filter(type == "Medulla")
+m2D <- scalemed[,which(colnames(scalemed) %in% d8$name)]
+m2DD <- apply(m2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m2D)) %>% 
+  'colnames<-' ("2D_med")
+
+d9 <- anno %>% filter(culture == "3D") #%>% filter(type == "Medulla")
+m3D <- scalemed[,which(colnames(scalemed) %in% d9$name)]
+m3DD <- apply(m3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m3D)) %>% 
+  'colnames<-' ("3D_med")
+
+# Keep the z-score but merge cortex and medulla together in one plot
+con <- cbind(tiss, c2DD, c3DD, mtiss, m2DD, m3DD)
+pheatmap(as.matrix(con), cluster_rows = F, show_rownames = T, 
+         cluster_cols = F, clustering_distance_rows = "euclidean", #annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         gaps_col = 3,
+         breaks = seq(-1, 1, length.out = 90))
+
+# Get the data frame so that the heatmap can be splited into S phase and G2M phase genes
+cellcycle <- cycle %>% as.data.frame() %>% 'colnames<-' ("Gene")
+cellcycle$group <- ifelse(cellcycle$Gene %in% s.genes, "S-phase", "G2M-phase")
+cellcycle <- cellcycle[which(cellcycle$Gene %in% rownames(c2D)),] 
+
+anno_group <- colnames(con) %>% as.data.frame()
+anno_group$group <- rep(c("Cortex", "Medulla"), each = 3)
+
+Heatmap(as.matrix(con), name = "Z-score",
+        cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_split = cellcycle$group,
+        row_gap = unit(2, "mm"),
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## Angiogenesis genes heatmap
+
+```{r Angiogenesis genes}
+
+angiogenesis <- bitr("GO:0001525", fromType = "GO", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+angio <- angiogenesis$SYMBOL
+
+# Cortex angiogenesis
+df <- normalized_counts[["Cortex"]]
+id_c <- match(angio, df$external_gene_name) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+d1 <- d1[!duplicated(d1$external_gene_name),]
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Cortex")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$name)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "2D") # %>% filter(type == "Cortex")
+c2D <- scalecor[,which(colnames(scalecor) %in% d5$name)]
+c2DD <- apply(c2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c2D)) %>% 
+  'colnames<-' ("2D")
+
+d6 <- anno %>% filter(culture == "3D") #%>% filter(type == "Cortex")
+c3D <- scalecor[,which(colnames(scalecor) %in% d6$name)]
+c3DD <- apply(c3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("3D")
+
+
+# Medulla angiogenesis
+df <- normalized_counts[["Medulla"]]
+id_m <- match(angio, df$external_gene_name)
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+d1 <- d1[!duplicated(d1$external_gene_name),]
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 100))
+
+d7 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Medulla")
+mtis <- scalemed[,which(colnames(scalemed) %in% d7$name)]
+mtiss <- apply(mtis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(mtis)) %>% 
+  'colnames<-' ("Tissue_med")
+
+d8 <- anno %>% filter(culture == "2D") #%>% filter(type == "Medulla")
+m2D <- scalemed[,which(colnames(scalemed) %in% d8$name)]
+m2DD <- apply(m2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m2D)) %>% 
+  'colnames<-' ("2D_med")
+
+d9 <- anno %>% filter(culture == "3D") #%>% filter(type == "Medulla")
+m3D <- scalemed[,which(colnames(scalemed) %in% d9$name)]
+m3DD <- apply(m3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m3D)) %>% 
+  'colnames<-' ("3D_med")
+
+# Combine cortex and medulla but keep the z score
+common <- intersect(rownames(tiss), rownames(mtiss))
+
+cortex <- cbind(tiss, c2DD, c3DD)
+cortex <- cortex[which(rownames(cortex) %in% common),]
+
+medulla <- cbind(mtiss, m2DD, m3DD)
+medulla <- medulla[which(rownames(medulla) %in% common),]
+con <- cbind(cortex, medulla)
+
+anno_group <- colnames(con) %>% as.data.frame()
+anno_group$group <- rep(c("Cortex", "Medulla"), each = 3)
+
+Heatmap(as.matrix(con), name = "Z-score",
+        #cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_km = 3,
+        #row_gap = unit(2, "mm"),
+        show_row_names = F,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## Hypoxia genes heatmap
+
+```{r Hypoxia genes}
+
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+kgn <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/hypoxia_genes.xlsx")
+hypoxia <- kgn[[1]]
+
+# Cortex hypoxia
+df <- normalized_counts[["Cortex"]]
+id_c <- match(hypoxia$gene, df$external_gene_name) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Cortex")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$name)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "2D") # %>% filter(type == "Cortex")
+c2D <- scalecor[,which(colnames(scalecor) %in% d5$name)]
+c2DD <- apply(c2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c2D)) %>% 
+  'colnames<-' ("2D")
+
+d6 <- anno %>% filter(culture == "3D") #%>% filter(type == "Cortex")
+c3D <- scalecor[,which(colnames(scalecor) %in% d6$name)]
+c3DD <- apply(c3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("3D")
+
+
+# Medulla hypoxia
+df <- normalized_counts[["Medulla"]]
+id_m <- match(hypoxia$gene, df$external_gene_name)
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 100))
+
+d7 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Medulla")
+mtis <- scalemed[,which(colnames(scalemed) %in% d7$name)]
+mtiss <- apply(mtis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(mtis)) %>% 
+  'colnames<-' ("Tissue_med")
+
+d8 <- anno %>% filter(culture == "2D") #%>% filter(type == "Medulla")
+m2D <- scalemed[,which(colnames(scalemed) %in% d8$name)]
+m2DD <- apply(m2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m2D)) %>% 
+  'colnames<-' ("2D_med")
+
+d9 <- anno %>% filter(culture == "3D") #%>% filter(type == "Medulla")
+m3D <- scalemed[,which(colnames(scalemed) %in% d9$name)]
+m3DD <- apply(m3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m3D)) %>% 
+  'colnames<-' ("3D_med")
+
+# Combine cortex and medulla but keep the z score
+common <- intersect(rownames(tiss), rownames(mtiss))
+
+cortex <- cbind(tiss, c2DD, c3DD)
+cortex <- cortex[which(rownames(cortex) %in% common),]
+
+medulla <- cbind(mtiss, m2DD, m3DD)
+medulla <- medulla[which(rownames(medulla) %in% common),]
+con <- cbind(cortex, medulla)
+
+anno_group <- colnames(con) %>% as.data.frame()
+anno_group$group <- rep(c("Cortex", "Medulla"), each = 3)
+
+Heatmap(as.matrix(con), name = "Z-score",
+        #cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_km = 5,
+        #row_gap = unit(2, "mm"),
+        show_row_names = F,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## Steroidogenesis genes heatmap
+
+```{r steroidogenesis genes}
+
+kgn <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/nuclear receptor.csv", sep = ";")
+steroid <- kgn$geneID
+
+# Cortex steroidogenesis
+df <- normalized_counts[["Cortex"]]
+id_c <- match(steroid, df$gene) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- cor_df
+d2 <- d2[which(d2$name %in% colnames(scalecor)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Cortex")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$name)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "2D") # %>% filter(type == "Cortex")
+c2D <- scalecor[,which(colnames(scalecor) %in% d5$name)]
+c2DD <- apply(c2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c2D)) %>% 
+  'colnames<-' ("2D")
+
+d6 <- anno %>% filter(culture == "3D") #%>% filter(type == "Cortex")
+c3D <- scalecor[,which(colnames(scalecor) %in% d6$name)]
+c3DD <- apply(c3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("3D")
+
+
+# Medulla steroidogenesis
+df <- normalized_counts[["Medulla"]]
+id_m <- match(steroid, df$gene) %>% na.omit()
+d1 <- df[id_m,] 
+d1 <- na.omit(d1)
+
+genes_m <- d1[,(ncol(d1)-2)]
+
+scalemed <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_m) %>% 
+  na.omit()
+rownames(scalemed) <- scalemed$external_gene_name
+
+d2 <- med_df
+d2 <- d2[which(d2$name %in% colnames(scalemed)),]
+
+anno <- d2[, c(1, 2, 7, 11)]
+rownames(anno) <- anno$name
+
+pheatmap(scalemed[, -ncol(scalemed)], cluster_rows = F, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 100))
+
+d7 <- anno %>% filter(culture == "Tissue") #%>% filter(type == "Medulla")
+mtis <- scalemed[,which(colnames(scalemed) %in% d7$name)]
+mtiss <- apply(mtis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(mtis)) %>% 
+  'colnames<-' ("Tissue_med")
+
+d8 <- anno %>% filter(culture == "2D") #%>% filter(type == "Medulla")
+m2D <- scalemed[,which(colnames(scalemed) %in% d8$name)]
+m2DD <- apply(m2D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m2D)) %>% 
+  'colnames<-' ("2D_med")
+
+d9 <- anno %>% filter(culture == "3D") #%>% filter(type == "Medulla")
+m3D <- scalemed[,which(colnames(scalemed) %in% d9$name)]
+m3DD <- apply(m3D, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(m3D)) %>% 
+  'colnames<-' ("3D_med")
+
+# Combine cortex and medulla but keep the z score
+common <- intersect(rownames(tiss), rownames(mtiss))
+
+cortex <- cbind(tiss, c2DD, c3DD)
+cortex <- cortex[which(rownames(cortex) %in% common),]
+
+medulla <- cbind(mtiss, m2DD, m3DD)
+medulla <- medulla[which(rownames(medulla) %in% common),]
+con <- cbind(cortex, medulla)
+
+anno_group <- colnames(con) %>% as.data.frame()
+anno_group$group <- rep(c("Cortex", "Medulla"), each = 3)
+
+Heatmap(as.matrix(con), name = "Z-score",
+        #cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_km = 5,
+        row_gap = unit(2, "mm"),
+        show_row_names = T,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## GO enrichment for steroidogenesis gene subgroups
+
+```{r GO for steroidogenesis gene subgroup}
+
+subgroup <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/steroid_subgroup.xlsx")
+subgroup <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/Clusters_1_5_Hypoxia.xlsx")
+subgroup <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/Clusters_1_5_Angiogenesis.xlsx")
+
+# Steroidogenesis
+kgn <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/nuclear receptor.csv", sep = ";")
+
+#for (i in 1:length(subgroup)) {
+#  subgroup[[i]] <- na.omit(subgroup[[i]])
+#  subgroup[[i]]$Gene <- gsub(" ", "", subgroup[[i]]$Gene)
+#}
+#openxlsx::write.xlsx(subgroup, file = "/Users/tianyili/Desktop/Ovarioid/results/Clusters_1_5_Angiogenesis.xlsx")
+
+steroid_list <- list()
+for (i in 1:length(subgroup)) {
+  temp1 <- merge(subgroup[[i]], kgn, by.x = "Gene", by.y = "gene", all.x = T, all.y = F)
+  steroid_list[[names(subgroup[i])]] <- merge(temp1, output, by.x = "geneID", 
+                            by.y = "ensembl_gene_id", all.x = T, all.y = F)
+}
+
+steroid_GO <- list()
+for (i in 1:length(steroid_list)) {
+  ego <- enrichGO(gene = steroid_list[[i]]$entrezgene_id, 
+                universe = res_shrunk[[2]]$entrezgene_id,
+                OrgDb = org.Hs.eg.db, ont = "ALL", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff = 0.05, readable = TRUE)
+  ego <- setReadable(ego, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  steroid_GO[[names(steroid_list)[i]]] <- ego@result %>% filter(p.adjust < 0.01)
+}
+
+openxlsx::write.xlsx(steroid_GO, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/steroid_5clusters_FDR_0.01_20230802.xlsx")
+
+# Top 5 most significant BP process
+
+steroid_GO_list <- list()
+for (i in 1:length(steroid_GO)) {
+  res_top10 <- steroid_GO[[i]] %>% filter(ONTOLOGY == "BP") %>% 
+    arrange(p.adjust)
+  res_top10 <- res_top10[1:5,]
+  orders <- res_top10$Description
+  res_top10$Description <- factor(res_top10$Description, levels = orders)
+  steroid_GO_list[[names(steroid_GO[i])]] <- ggplot(res_top10, aes(y = GeneRatio, x = Description)) + 
+    geom_bar(stat = "identity", fill = "#ADD187") + theme_bw() + coord_flip() +
+    ggtitle(paste0("Top5 most significant GO - ", names(steroid_GO[i])))
+}
+steroid_GO_list[[5]] + steroid_GO_list[[4]] + steroid_GO_list[[2]] +
+  steroid_GO_list[[1]] + steroid_GO_list[[3]] + plot_layout(guides = "collect", ncol = 1)
+
+# Hypoxia
+steroid_list <- list()
+for (i in 1:length(subgroup)) {
+  temp1 <- subgroup[[i]]
+  steroid_list[[names(subgroup[i])]] <- merge(temp1, output, by.x = "Gene", 
+                            by.y = "external_gene_name", all.x = T, all.y = F)
+}
+
+steroid_GO <- list()
+for (i in 1:length(steroid_list)) {
+  print(names(steroid_list)[i])
+  ego <- enrichGO(gene = steroid_list[[i]]$entrezgene_id, 
+                universe = res_shrunk[[2]]$entrezgene_id,
+                OrgDb = org.Hs.eg.db, ont = "ALL", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff = 0.05, readable = TRUE)
+  ego <- setReadable(ego, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  steroid_GO[[names(steroid_list)[i]]] <- ego@result %>% filter(p.adjust < 0.01)
+}
+
+openxlsx::write.xlsx(steroid_GO, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/hypoxia_5clusters_FDR_0.01_20230802.xlsx")
+
+# Top 10 most significant BP process
+
+steroid_GO_list <- list()
+for (i in 1:length(steroid_GO)) {
+  res_top10 <- steroid_GO[[i]] %>% filter(ONTOLOGY == "BP") %>% 
+    arrange(p.adjust)
+  res_top10 <- res_top10[1:10,]
+  orders <- res_top10$Description
+  res_top10$Description <- factor(res_top10$Description, levels = orders)
+  steroid_GO_list[[names(steroid_GO[i])]] <- ggplot(res_top10, aes(y = GeneRatio, x = Description)) + 
+    geom_bar(stat = "identity", fill = "#ADD187") + theme_bw() + coord_flip() +
+    ggtitle(paste0("Top10 most significant GO - ", names(steroid_GO[i])))
+}
+steroid_GO_list[[5]] + steroid_GO_list[[4]] + steroid_GO_list[[2]] +
+  steroid_GO_list[[1]] + steroid_GO_list[[3]] + plot_layout(guides = "collect", ncol = 1)
+
+# Angiogenesis
+steroid_list <- list()
+for (i in 1:length(subgroup)) {
+  temp1 <- subgroup[[i]]
+  steroid_list[[names(subgroup[i])]] <- merge(temp1, output, by.x = "Gene", 
+                            by.y = "external_gene_name", all.x = T, all.y = F)
+}
+
+steroid_GO <- list()
+for (i in 1:length(steroid_list)) {
+  print(names(steroid_list)[i])
+  ego <- enrichGO(gene = steroid_list[[i]]$entrezgene_id, 
+                universe = res_shrunk[[2]]$entrezgene_id,
+                OrgDb = org.Hs.eg.db, ont = "ALL", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff = 0.05, readable = TRUE)
+  ego <- setReadable(ego, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+  steroid_GO[[names(steroid_list)[i]]] <- ego@result %>% filter(p.adjust < 0.01)
+}
+
+openxlsx::write.xlsx(steroid_GO, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/angiogenesis_3clusters_FDR_0.01_20230802.xlsx")
+
+# Top 20 most significant BP process
+
+steroid_GO_list <- list()
+for (i in 1:length(steroid_GO)) {
+  res_top10 <- steroid_GO[[i]] %>% filter(ONTOLOGY == "BP") %>% 
+    arrange(p.adjust)
+  res_top10 <- res_top10[1:20,]
+  orders <- res_top10$Description
+  res_top10$Description <- factor(res_top10$Description, levels = orders)
+  steroid_GO_list[[names(steroid_GO[i])]] <- ggplot(res_top10, aes(y = GeneRatio, x = Description)) + 
+    geom_bar(stat = "identity", fill = "#ADD187") + theme_bw() + coord_flip() +
+    ggtitle(paste0("Top20 most significant GO - ", names(steroid_GO[i])))
+}
+steroid_GO_list[[2]] + steroid_GO_list[[3]] + steroid_GO_list[[1]] + plot_layout(guides = "collect", ncol = 1)
+
+
+```
+
+
+## Venn diagram for hypoxia and angiogenesis genes
+
+```{r intersect hypoxia and angiogenesis}
+
+universe <- intersect(hypoxia$gene, angiogenesis$SYMBOL)
+
+VennDiagram::venn.diagram(
+  x = list(hypoxia$gene, angiogenesis$SYMBOL),
+  category.names = c("Hypoxia" , "Angiogenesis"),
+  filename = 'Venn for hypoxia and angiogenesis.png',
+  output=TRUE,
+  # Circles
+        lwd = 2,
+        col=c("#8dd3c7","#fb8072"),
+        fill = c(alpha("#8dd3c7",1),alpha("#fb8072",1)),
+        scaled = F,
+        cex = 1.5,
+        fontface = "bold",
+        fontfamily = "sans",
+        # Set names
+        cat.cex = 0.8,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.fontfamily = "sans",
+        cat.col =  c("#8dd3c7","#fb8072")
+)
+
+
+
+```
+
+
+## Random forest/decision tree to get the most important genes from DEGs list
+
+```{r random forest & decision tree}
+
+scalecor <- scale(t(cor_count[,2:(ncol(cor_count)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., cor_count$gene) %>% 
+  na.omit()
+
+scalecor <- scalecor[-which(duplicated(scalecor$`cor_count$gene`)),]
+rownames(scalecor) <- scalecor$`cor_count$gene`
+d1 <- t(scalecor[, -ncol(scalecor)]) %>% as.data.frame()
+
+info <- cor_df
+info <- info %>% select(name, culture)
+d1$id <- rownames(d1)
+
+d1 <- merge(d1, info, by.x = "id", by.y = "name", all.x = T, all.y = F)
+d1 <- d1[, -1]
+
+d2 <- d1 %>% filter(culture != "2D")
+d2 <- d1
+
+# split data into testing and training
+set.seed(100)
+inTest <- createDataPartition(y = d2$culture, p = 0.25, list = F)
+
+test <- d2[inTest,]
+train <- d2[-inTest,]
+
+# random forest
+train$culture <- factor(train$culture)
+test$culture <- factor(test$culture)
+
+class_forest <- randomForest(culture ~ ., data = train, ntree = 10)
+pred <- predict(class_forest, newdata = test)
+conf_matrix <- table(pred, test$culture)
+accuracy <- sum(diag(conf_matrix))/sum(conf_matrix)
+accuracy
+d3 <- importance(class_forest) %>% as.data.frame() %>%  arrange(desc(MeanDecreaseGini))
+d4 <- importance(class_forest) %>% as.data.frame() %>%  arrange(desc(MeanDecreaseGini))
+
+# decision tree
+class_tree <- tree(culture ~ ., data = train)
+#class_tree <- rpart(culture ~ ., data = train)
+class_tree
+pred_full <- predict(class_tree, test)
+pred_short <- ifelse(pred_full[,"Tissue"] > 0.5, "Tissue", "Fresh_No")
+conf_matrix <- table(pred_short, test$cultures)
+conf_matrix
+
+# logistic regression
+d5 <- train
+d5$class <- ifelse(str_detect(d5$culture, "3D"), 1, 0)
+d5$class <- as.factor(d5$class)
+y <- glm(d5$class ~ ., family = binomial(link = "logit"), data = d5[, -c(ncol(d5)-1)])
+d6 <- summary(y)
+
+```
+
+
+## Difference between different culture condition
+
+```{r fresh vs frozen 3D}
+
+res_shrunk <- list()
+for (i in type) {
+  for (j in culture) {
+      dataset[[paste0("dds_", i)]]$culture <- relevel(dataset[[paste0("dds_", i)]]$culture, ref = "Tissue")
+      dataset[[paste0("dds_", i)]] <- nbinomWaldTest(dataset[[paste0("dds_", i)]], maxit=1000)
+      print(paste0(i, "_", j, "_vs_Tissue"))
+      res_shrunk[[paste0(i, "_", j, "_vs_Tissue")]] <- lfcShrink(dataset[[paste0("dds_", i)]], 
+                                          coef =  match(paste0("culture_", j,"_vs_Tissue"),   
+                                          resultsNames(dataset[[paste0("dds_", i)]])), 
+                                          type = "apeglm") %>% as.data.frame() %>% 
+                                          mutate(geneid = rownames(.))
+  }
+} 
+
+# 2D and 3D comparison
+temp1 <- list()
+for (i in type) {
+      dataset[[paste0("dds_", i)]]$culture <- relevel(dataset[[paste0("dds_", i)]]$culture, ref = "2D")
+      dataset[[paste0("dds_", i)]] <- nbinomWaldTest(dataset[[paste0("dds_", i)]], maxit=1000)
+      print(paste0(i, "_3D_vs_2D"))
+      temp1[[paste0(i, "_3D_vs_2D")]] <- lfcShrink(dataset[[paste0("dds_", i)]], 
+                                          coef =  match(paste0("culture_", "3D", "_vs_2D"),   
+                                          resultsNames(dataset[[paste0("dds_", i)]])), 
+                                          type = "apeglm") %>% as.data.frame() %>% 
+                                          mutate(geneid = rownames(.))
+} 
+
+res_shrunk <- c(res_shrunk, temp1)
+
+shrunk_sig <- list()
+for (i in 1:length(res_shrunk)) {
+    shrunk_sig[[names(res_shrunk)[i]]] <- res_shrunk[[i]] %>% 
+      filter(padj < 0.05) %>% 
+      filter(abs(log2FoldChange) > 2) %>%  
+      filter(baseMean > 100)
+}
+
+
+res_shrunk <- lapply(res_shrunk, function(x) {
+  x <- get_id(x)
+})
+
+shrunk_sig <- lapply(shrunk_sig, function(x) {
+  x <- get_id(x)
+})
+
+
+```
+
+## Gene set analysis
+
+```{r hallmark gene set analysis}
+
+msigHs_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  select(gs_name, entrez_gene) %>% 
+  as.data.frame()
+
+msigHs_c2 <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  select(gs_name, entrez_gene) %>% 
+  as.data.frame()
+
+GeneList <- list()
+for(i in 1:length(shrunk_sig)){
+  genelist <- shrunk_sig[[i]] %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    mutate(logpadj = ifelse(log2FoldChange<0, log10(padj), -log10(padj))) %>% 
+    filter(!is.na(entrezgene_id)) 
+  #genelist <- genelist %>% mutate(rank = rank(log2FoldChange, ties.method = "random")) %>% arrange(desc(rank))
+  GeneList[[names(shrunk_sig)[i]]] <- genelist$log2FoldChange
+  names(GeneList[[names(shrunk_sig)[i]]]) <- as.character(genelist$entrezgene_id)
+  GeneList[[names(shrunk_sig)[i]]] <- sort(GeneList[[names(shrunk_sig)[i]]], decreasing = T)
+  #GeneList[[names(shrunk_sig)[i]]] <- GeneList[[names(shrunk_sig)[i]]][!duplicated(names(GeneList[[names(shrunk_sig)[i]]]))]
+}
+
+GSEA_hallmark <- list()
+GSEA_hallmark_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- GSEA(geneList = GeneList[[i]], minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+  GSEA_hallmark[[names(GeneList)[i]]] <- edo 
+  GSEA_hallmark_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+for (i in 1:length(GSEA_hallmark)) {
+  GSEA_hallmark[[i]] <- setReadable(GSEA_hallmark[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GSEA_hallmark, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_gsea_hallmark_20230731.xlsx")
+
+selected <- c("HALLMARK_HYPOXIA", "HALLMARK_ANGIOGENESIS")
+cnetplot(GSEA_hallmark[["Cortex_3D_vs_Tissue"]], showCategory = selected, 
+         foldChange = GeneList[["Cortex_3D_vs_Tissue"]]) +
+  ggtitle("Cortex")
+cnetplot(GSEA_hallmark[["Medulla_3D_vs_Tissue"]], showCategory = selected, foldChange = GeneList[["Medulla_3D_vs_Tissue"]]) +
+  ggtitle("Medulla")
+
+GSEA_c2 <- list()
+GSEA_c2_df <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  edo <- GSEA(geneList = GeneList[[i]], minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_c2)
+  GSEA_c2[[names(GeneList)[i]]] <- edo 
+  GSEA_c2_df[[names(GeneList)[i]]] <- edo %>% as.data.frame()
+}
+
+for (i in 1:length(GSEA_c2)) {
+  GSEA_c2[[i]] <- setReadable(GSEA_c2[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GSEA_c2, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_gsea_c2_20230731.xlsx")
+
+```
+
+## Plot GSEA results
+
+```{r GSEA plotting}
+
+GSEA_hallmark_df <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_gsea_hallmark_20231130.xlsx")
+
+GSEA_hallmark_df <- lapply(GSEA_hallmark_df, function(x) {
+  x <- x %>% dplyr::filter(p.adjust < 0.05)
+})
+
+deg_df <- data.frame()
+for (i in names(GSEA_hallmark_df)){
+  deg <- GSEA_hallmark_df[[i]] %>% mutate(group = rep(i, nrow(GSEA_hallmark_df[[i]])))
+  deg_df <- rbind(deg_df, deg) 
+}
+
+set <- deg_df %>% 
+  mutate(type = (ifelse(str_detect(group, "Cortex"), "Cortex", "Medulla"))) %>% 
+  mutate(culture = (ifelse(str_detect(group, "2D"), "2D", "3D")))
+
+# remove 3D vs 2D medulla
+set <- set[-c(81:82),]
+
+d5 <- set %>% select(ID, NES, group, type, culture)
+
+d6 <- d5 %>% filter(type == "Cortex")
+d6 <- d5 %>% filter(type == "Medulla")
+d6$regulate <- ifelse(str_detect(d6$NES, "-"), "Down", "Up")
+d6$score <- abs(d6$NES)
+d6$score <- ifelse(str_detect(d6$culture, "2D"), as.numeric(paste0("-", d6$score)), d6$score)
+all <- d6$ID %>% unique()
+
+# Cortex dataset
+temp3 <- d6[1:19,] %>% arrange(desc(score)) # take the unique ID for 2D dataset and arrange by score
+orders <- temp3$ID
+setdiff(all, orders)
+# Add the gene set not in the previous sorting
+orders <- c(orders, "HALLMARK_KRAS_SIGNALING_UP", "HALLMARK_ALLOGRAFT_REJECTION",
+            "HALLMARK_APOPTOSIS", "HALLMARK_ANDROGEN_RESPONSE", "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+            "HALLMARK_IL2_STAT5_SIGNALING")
+d6$ID <- factor(d6$ID, levels = orders)
+
+# Medulla dataset
+temp4 <- d6[1:21,] %>% arrange(desc(score))
+orders <- temp4$ID
+setdiff(all, orders)
+orders <- c(orders, "HALLMARK_KRAS_SIGNALING_UP", 
+            "HALLMARK_INTERFERON_GAMMA_RESPONSE")
+d6$ID <- factor(d6$ID, levels = orders)
+
+ggplot(d6, aes(x = ID, y = score, fill = regulate)) + 
+  geom_bar(position = "dodge", stat = "identity") +
+  scale_fill_manual(values = c( "#ADD187", "#8481BA")) +
+  geom_hline(yintercept = 0, color = "black", size = 1) +
+  coord_flip() + ylab("NES") + xlab("") +
+  ggtitle("GSEA analysis - Medulla") +
+  theme(text=element_text(size=15),
+               axis.text.x=element_text(color="black", angle = 90, vjust = 0.3, hjust = 0.3),
+               axis.text.y=element_text(color="black"),
+               axis.ticks.x.bottom=element_blank(),
+               strip.background = element_rect(colour=NA, fill=NA),
+               plot.background = element_blank(),
+               panel.spacing.x=unit(.5, "lines"),
+               panel.border = element_rect(color = "black", fill = NA, linewidth = 1),
+               axis.line.x = element_line(linewidth=0.4),
+               axis.line.y = element_line(linewidth=0.4),
+               legend.key.size = unit(2, 'lines'),
+               panel.background = element_blank()
+)
+
+```
+
+## Venn diagram
+
+```{r venn diagram}
+
+VennDiagram::venn.diagram(
+  x = list(na.omit(comparison05[[1]]$geneid), na.omit(comparison05[[2]]$geneid)),
+  category.names = c("2D" , "3D"),
+  filename = 'Venn for cortex 2D and 3D vs Tissue overlap sig05 FC2.png',
+  #filename = NULL,
+  output=TRUE,
+  # Circles
+        lwd = 2,
+        col=c("#8dd3c7","#fb8072"),
+        fill = c(alpha("#8dd3c7",1),alpha("#fb8072",1)),
+        scaled = F,
+        cex = 1.5,
+        fontface = "bold",
+        fontfamily = "sans",
+        # Set names
+        cat.cex = 0.8,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.fontfamily = "sans",
+        cat.col =  c("#8dd3c7","#fb8072")
+)
+
+
+```
+
+## Venn diagram of GO hypoxia, cell cycle, angiogenesis and apoptotic signaling pathway
+
+```{r Venn diagram of GO terms}
+
+apoptosis <- bitr("GO:0097190", fromType = "GO", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+
+kgn <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/hypoxia_genes.xlsx")
+hypoxia <- kgn[[1]]
+
+angiogenesis <- bitr("GO:0001525", fromType = "GO", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+angio <- angiogenesis$SYMBOL
+
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+cycle <- c(s.genes, g2m.genes)
+
+VennDiagram::venn.diagram(
+  x = list(apoptosis$SYMBOL, cycle, hypoxia$gene, angio),
+  category.names = c("Apoptosis" , "Cell Cycle", "Hypoxia", "Angiogenesis"),
+  filename = 'Venn for GO term overlap.png',
+  #filename = NULL,
+  output=TRUE,
+  # Circles
+        lwd = 2,
+        col=c("#8dd3c7","#fdb462", "#bebada", "#80b1d3"),
+        fill = c(alpha("#8dd3c7",1),alpha("#fdb462",1), alpha("#bebada",1), alpha("#80b1d3",1)),
+        scaled = F,
+        cex = 1.5,
+        fontface = "bold",
+        fontfamily = "sans",
+        # Set names
+        cat.cex = 0.8,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.fontfamily = "sans",
+        cat.col =  c("#8dd3c7","#fdb462", "#bebada", "#80b1d3")
+)
+
+# Hallmark gene set overlapping
+
+angiog <- read.delim("/Users/tianyili/Downloads/HALLMARK_ANGIOGENESIS.v2023.2.Hs.tsv")
+angio <- str_split(angiog[which(angiog$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+
+apoptosis <- read.delim("/Users/tianyili/Downloads/HALLMARK_APOPTOSIS.v2023.2.Hs.tsv")
+apop <- str_split(apoptosis[which(apoptosis$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+
+g2m <- read.delim("/Users/tianyili/Downloads/HALLMARK_G2M_CHECKPOINT.v2023.2.Hs.tsv")
+g2m <- str_split(g2m[which(g2m$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+
+hypoxia <- read.delim("/Users/tianyili/Downloads/HALLMARK_HYPOXIA.v2023.2.Hs.tsv")
+hypo <- str_split(hypoxia[which(hypoxia$STANDARD_NAME == "GENE_SYMBOLS"), 2], ",", simplify = F) %>% unlist()
+
+VennDiagram::venn.diagram(
+  x = list(apop, g2m, hypo, angio),
+  category.names = c("Apoptosis" , "G2M checkpoint", "Hypoxia", "Angiogenesis"),
+  filename = 'Venn for Hallmark overlap.png',
+  #filename = NULL,
+  output=TRUE,
+  # Circles
+        lwd = 2,
+        col=c("#8dd3c7","#fdb462", "#bebada", "#80b1d3"),
+        fill = c(alpha("#8dd3c7",1),alpha("#fdb462",1), alpha("#bebada",1), alpha("#80b1d3",1)),
+        scaled = F,
+        cex = 1.5,
+        fontface = "bold",
+        fontfamily = "sans",
+        # Set names
+        cat.cex = 0.8,
+        cat.fontface = "bold",
+        cat.default.pos = "outer",
+        cat.fontfamily = "sans",
+        cat.col =  c("#8dd3c7","#fdb462", "#bebada", "#80b1d3")
+)
+
+```
+
+
+## GSEA for 3D specific DEGs
+
+```{r gsea 3D specific DEGs}
+
+common <- intersect(final[[1]]$geneid, final[[2]]$geneid)
+deg_3d <- final[[2]][-which(final[[2]]$geneid %in% common),] 
+
+genelist <- deg_3d %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id))
+gl <- genelist$log2FoldChange
+names(gl) <- as.character(genelist$entrezgene_id)
+gl <- sort(gl, decreasing = T)
+
+edo <- GSEA(geneList = gl, minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+
+edo <- setReadable(edo, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+result <- edo@result %>% as.data.frame()
+
+# 2D specific DEGs enrichment
+deg_2d <- final[[1]][-which(final[[1]]$geneid %in% common),] 
+
+genelist <- deg_2d %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id))
+gl <- genelist$log2FoldChange
+names(gl) <- as.character(genelist$entrezgene_id)
+gl <- sort(gl, decreasing = T)
+
+edo <- GSEA(geneList = gl, minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+
+edo <- setReadable(edo, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+result2 <- edo@result %>% as.data.frame()
+
+write.csv(result, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/GSEA_3D_specific_DEGs_cortex_20230731.csv")
+write.csv(result2, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/GSEA_2D_specific_DEGs_cortex_20230731.csv")
+
+#### Medulla
+
+common <- intersect(final[[3]]$geneid, final[[4]]$geneid)
+deg_3d <- final[[4]][-which(final[[4]]$geneid %in% common),] 
+
+genelist <- deg_3d %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id))
+gl <- genelist$log2FoldChange
+names(gl) <- as.character(genelist$entrezgene_id)
+gl <- sort(gl, decreasing = T)
+
+edo <- GSEA(geneList = gl, minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+
+edo <- setReadable(edo, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+result <- edo@result %>% as.data.frame()
+
+# 2D specific DEGs enrichment
+deg_2d <- final[[3]][-which(final[[3]]$geneid %in% common),] 
+
+genelist <- deg_2d %>% dplyr::select(entrezgene_id, log2FoldChange, padj) %>% 
+    filter(!is.na(entrezgene_id))
+gl <- genelist$log2FoldChange
+names(gl) <- as.character(genelist$entrezgene_id)
+gl <- sort(gl, decreasing = T)
+
+edo <- GSEA(geneList = gl, minGSSize = 10, maxGSSize = 500,
+            pvalueCutoff = 1,
+            pAdjustMethod = "BH",
+            TERM2GENE = msigHs_h)
+
+edo <- setReadable(edo, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+result2 <- edo@result %>% as.data.frame()
+
+write.csv(result, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/GSEA_3D_specific_DEGs_medulla_20230731.csv")
+write.csv(result2, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/GSEA_2D_specific_DEGs_medulla_20230731.csv")
+
+
+```
+
+## enrichKEGG and gseKEGG
+
+```{r enrich KEGG}
+
+KEGG_enrich <- list()
+for(i in 1:length(shrunk_sig)){
+  print(names(shrunk_sig)[i])
+  KEGG_enrich[[names(shrunk_sig)[i]]] <- enrichKEGG(gene = shrunk_sig[[i]]$entrezgene_id, 
+                       organism = 'hsa',
+                       pvalueCutoff = 0.1)
+}
+
+for (i in 1:length(KEGG_enrich)) {
+  KEGG_enrich[[i]] <- setReadable(KEGG_enrich[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(KEGG_enrich, "/Users/tianyi.li.2/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_sigDEGs_enricher_KEGG_20230222.xlsx")
+
+KEGG_gsea <- list()
+for(i in 1:length(GeneList)){
+  print(names(GeneList)[i])
+  KEGG_gsea[[names(GeneList)[i]]] <- gseKEGG(geneList = GeneList[[i]], 
+               organism     = 'hsa',
+               minGSSize    = 10,
+               pvalueCutoff = 0.1,
+               verbose      = FALSE)
+}
+
+for (i in 1:length(KEGG_gsea)) {
+  KEGG_gsea[[i]] <- setReadable(KEGG_gsea[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(KEGG_gsea, "/Users/tianyi.li.2/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_sigDEGs_GSEA_KEGG_20230222.xlsx")
+
+```
+
+## GO analysis
+
+```{r GO analysis}
+
+GO_enrich <- list()
+for(i in 1:length(shrunk_sig)){
+  print(names(shrunk_sig)[i])
+  GO_enrich[[names(shrunk_sig)[i]]] <- enrichGO(gene = shrunk_sig[[i]]$entrezgene_id, 
+                                                     universe = res_shrunk[[i]]$entrezgene_id,
+                                                     OrgDb = org.Hs.eg.db, ont = "ALL", 
+                                                     pAdjustMethod = "BH", 
+                                                     pvalueCutoff = 0.05, readable = TRUE)
+}
+
+for (i in 1:length(GO_enrich)) {
+  GO_enrich[[i]] <- setReadable(GO_enrich[[i]], OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+}
+
+openxlsx::write.xlsx(GO_enrich, "/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_S71_removed_sigDEGs_enrichGO_20230731.xlsx")
+
+```
+
+## Plot GO analysis results
+
+```{r plot GO analysis results}
+
+dotplot(ego, showCategory = 50,  orderBy="GeneRatio") +
+      ggtitle("Dotplot - enrich GO") + scale_color_continuous(low = "purple", high = "green") 
+
+```
+
+## Correlation between hypoxia and steroidogenesis
+
+```{r correlation between hypoxia and steroid genes}
+
+# "Cortex_2D_vs_Tissue"  "Cortex_3D_vs_Tissue"  "Medulla_2D_vs_Tissue" "Medulla_3D_vs_Tissue" "Cortex_3D_vs_2D"     
+# "Medulla_3D_vs_2D"   
+
+d9 <- final[["Cortex_2D_vs_Tissue"]]
+hypo_2d <- d9[which(d9$external_gene_name %in% hypoxia$gene),]
+hypo_2d <- hypo_2d %>% arrange(log2FoldChange)
+hypo_2d <- hypo_2d[1:25,]
+
+ster_2d <- d9[which(d9$geneid %in% steroid),]
+#ster_2d <- ster_2d %>% arrange(log2FoldChange)
+
+# merge them into one dataframe
+temp7 <- cbind(hypo_2d$log2FoldChange, ster_2d$log2FoldChange) %>% as.data.frame()
+colnames(temp7) <- c("Hypoxia", "Steroidogenesis")
+temp7$group <- rep("2D", 25)
+
+d10 <- final[["Cortex_3D_vs_Tissue"]]
+hypo_3d <- d10[which(d10$external_gene_name %in% hypoxia$gene),]
+hypo_3d <- hypo_3d %>% arrange(log2FoldChange)
+hypo_3d <- hypo_3d[1:24,]
+
+ster_3d <- d10[which(d10$geneid %in% steroid),]
+#ster_3d <- ster_3d %>% arrange(log2FoldChange)
+
+temp8 <- cbind(hypo_3d$log2FoldChange, ster_3d$log2FoldChange) %>% as.data.frame()
+colnames(temp8) <- c("Hypoxia", "Steroidogenesis")
+temp8$group <- rep("3D", 24)
+
+temp9 <- rbind(temp7, temp8)
+ggplot(temp9, aes(x = Hypoxia, y = Steroidogenesis, col = group)) + geom_point() + theme + 
+  xlab("Hypoxia log2FC") + ylab("Steroidogenesis log2FC") + 
+  ggtitle("Cortex - Correlation between hypoxia and steroidogenesis") + 
+  scale_color_manual(values = c("#f16c23","#1b7c3d"))
+
+##### Medulla
+
+d9 <- final[["Medulla_2D_vs_Tissue"]]
+hypo_2d <- d9[which(d9$external_gene_name %in% hypoxia$gene),]
+hypo_2d <- hypo_2d %>% arrange(log2FoldChange)
+
+ster_2d <- d9[which(d9$geneid %in% steroid),]
+hypo_2d <- hypo_2d[1:24,]
+
+# merge them into one dataframe
+temp7 <- cbind(hypo_2d$log2FoldChange, ster_2d$log2FoldChange) %>% as.data.frame()
+colnames(temp7) <- c("Hypoxia", "Steroidogenesis")
+temp7$group <- rep("2D", 24)
+
+d10 <- final[["Medulla_3D_vs_Tissue"]]
+hypo_3d <- d10[which(d10$external_gene_name %in% hypoxia$gene),]
+hypo_3d <- hypo_3d %>% arrange(log2FoldChange)
+
+ster_3d <- d10[which(d10$geneid %in% steroid),]
+hypo_3d <- hypo_3d[1:25,]
+
+temp8 <- cbind(hypo_3d$log2FoldChange, ster_3d$log2FoldChange) %>% as.data.frame()
+colnames(temp8) <- c("Hypoxia", "Steroidogenesis")
+temp8$group <- rep("3D", 25)
+
+temp9 <- rbind(temp7, temp8)
+ggplot(temp9, aes(x = Hypoxia, y = Steroidogenesis, col = group)) + geom_point() + theme + 
+  xlab("Hypoxia log2FC") + ylab("Steroidogenesis log2FC") + 
+  ggtitle("Medulla - Correlation between hypoxia and steroidogenesis") + 
+  scale_color_manual(values = c("#f16c23","#1b7c3d"))
+
+```
+
+## Density plot for all genes
+
+```{r density plot}
+
+# get normalized count matrix for all expressed genes
+cortex <- normalized_counts[[1]] 
+cortex <- cortex[!duplicated(cortex$external_gene_name),]
+
+scalecor <- scale(t(cortex[,2:(ncol(cortex)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() 
+
+d2 <- cor_df
+
+# Add up each column to get more row
+temp5 <- scalecor[,1] %>% as.data.frame()
+temp5$sample <- rep(colnames(scalecor[1]), nrow(temp5))
+
+for (i in 2:ncol(scalecor)) {
+  temp6 <- scalecor[,i] %>% as.data.frame()
+  temp6$sample <- rep(colnames(scalecor[i]), nrow(temp6))
+  temp5 <- rbind(temp5, temp6)
+}
+
+# Add the group information to the data frame
+temp5$group <- NA
+for (i in unique(temp5$sample)) {
+  group <- d2[which(d2$name == i), which(colnames(d2) == "culture")]
+  temp5[which(temp5$sample == i),3] <- rep(group, length(which(temp5$sample == i)))
+}
+
+ggplot(temp5, aes(x = ., col = group)) + geom_density() + theme +
+  ggtitle("Density plot for normalized reads of all expressed genes")
+
+# Kolmogorov-Smirnov Tests to test difference between distributions
+dgof::ks.test(temp5$.[which(temp5$group %in% c("2D"))], 
+              temp5$.[which(temp5$group %in% c("Tissue"))])
+
+## Select genes with z-score between -2 to -1.5
+temp6 <- temp5 %>% filter(z_score > -2) %>% filter(z_score < -1.5)
+
+# Medulla
+medulla <- normalized_counts[[2]] 
+medulla <- medulla[!duplicated(medulla$external_gene_name),]
+scalemed <- scale(t(medulla[,2:(ncol(medulla)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame()
+
+d2 <- med_df
+
+# Add up each column to get more row
+temp5 <- scalemed[,1] %>% as.data.frame()
+temp5$sample <- rep(colnames(scalemed[1]), nrow(temp5))
+
+for (i in 2:ncol(scalemed)) {
+  temp6 <- scalemed[,i] %>% as.data.frame()
+  temp6$sample <- rep(colnames(scalemed[i]), nrow(temp6))
+  temp5 <- rbind(temp5, temp6)
+}
+
+# Add the group information to the data frame
+temp5$group <- NA
+for (i in unique(temp5$sample)) {
+  group <- d2[which(d2$name == i), which(colnames(d2) == "culture")]
+  temp5[which(temp5$sample == i),3] <- rep(group, length(which(temp5$sample == i)))
+}
+
+ggplot(temp5, aes(x = ., col = group)) + geom_density() + theme +
+  ggtitle("Medulla - Density plot for normalized reads of all expressed genes")
+
+```
+
+## Proteomics correlation with transcriptomics
+
+```{r proteomics correlation}
+
+protein <- readxl::read_excel("/Users/tianyili/Desktop/Ovarioid/data/20220517_HF1_Valentina_BioSilk_Ovaroid_3D.xlsx")
+
+description <- str_split(protein$Description, "=", simplify = T) %>% as.data.frame()
+description$V4 <- gsub(" PE", "", description$V4)
+
+protein$gene <- description$V4
+pro <- protein %>% select(Description, gene, `Abundance: F10: Sample, Cortex`,
+                          `Abundance: F11: Sample, Cortex`, `Abundance: F12: Sample, Cortex`,
+                          `Abundance: F13: Sample, Cortex`, `Abundance: F6: Sample, Medulla`,
+                          `Abundance: F7: Sample, Medulla`, `Abundance: F8: Sample, Medulla`,
+                          `Abundance: F9: Sample, Medulla`)
+
+angio_pro <- intersect(pro$gene, angio)
+angio_protein <- pro[which(pro$gene %in% angio_pro),]
+
+# Cortex
+angio_protein_c <- angio_protein[, 3:6]
+rownames(angio_protein_c) <- angio_protein$gene
+scaleangio_c <- scale(t(angio_protein_c), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% 
+  na.omit()
+
+angio_c <- apply(scaleangio_c, 1, mean) %>% as.data.frame() %>% na.omit()
+angio_c$gene <- rownames(angio_c)
+
+df <- normalized_counts[["Cortex"]]
+id_c <- match(angio_c$gene, df$external_gene_name) %>% na.omit()
+d1 <- df[id_c,] 
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+d2 <- cor_df %>% filter(culture == "3D")
+d3 <- d1[, c(1, 16:18, which(colnames(d1) %in% d2$name))]
+
+scalecor <- scale(t(d3[,5:(ncol(d3))]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+c3D <- scalecor[, -6]
+c3DD <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(c3D)) %>% 
+  'colnames<-' ("transcript")
+
+c3DD$gene <- rownames(c3DD)
+c3DD_pro <- merge(angio_c, c3DD, by.x = "gene", by.y = "gene", all.x =T, all.y = F)
+colnames(c3DD_pro) <- c("gene", "protein", "transcript")
+
+rownames(c3DD_pro) <- c3DD_pro$gene
+Heatmap(as.matrix(c3DD_pro[, 2:3]),
+        cluster_columns = T,
+        clustering_distance_rows = "euclidean",
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+ggplot(c3DD_pro, aes(x = transcript, y = protein)) + geom_point() + theme +
+  ggtitle("Angiogenesis - Cortex correlation")
+
+```
+
+## Merge IVA cortex and ovarioid cortex
+
+```{r merge with IVA project}
+
+# import IVA data
+iva_bulk <- read.delim("/Users/tianyili/Desktop/TC_project/results/deconvolution data/raw_count.txt", skip = 1)
+iva_info <- read.csv("/Users/tianyili/Desktop/TC_project/results/deconvolution data/info.csv", sep = ";")
+iva_info <- iva_info[-34,]
+iva_info <- iva_info %>% filter(Culture != "LN521")
+iva_info <- iva_info %>% 
+  mutate(culture = ifelse(str_detect(Culture, "Fresh"), "Fresh", "Cultured")) %>% 
+  mutate(cultures = paste0(culture, "_", Activator))
+
+iva_bulk <- iva_bulk[, -c(2:6, 40, 49)]
+rownames(iva_bulk) <- iva_bulk$Geneid
+
+iva_info <- iva_info[-c(2,18:21,25,30:31,26,36,38,33),] # remove replicates
+iva_info <- iva_info %>% filter(Activator != "Yes") # keep fragmentation group
+iva_bulk <- iva_bulk[, which(colnames(iva_bulk) %in% iva_info$Sample)]
+
+cells <- read.csv(file = "/Users/tianyili/Desktop/Ovarioid/data/processed/cells_Cortex.csv", sep = ",")
+info <- read.csv(file = "/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+
+iva_bulk$gene <- rownames(iva_bulk)
+all <- merge(iva_bulk, cells, by.x = "gene", by.y = "X")
+rownames(all) <- all$gene
+all <- all[,-1]
+
+# merge metadata file
+info_iva <- iva_info %>% select(Sample, Patient_ID, culture)
+colnames(info_iva) <- c("name", "group", "culture")
+info_iva$batch <- rep("HiSeq2000", nrow(info_iva))
+info_iva$type <- rep("csec", nrow(info_iva))
+
+info_ovarioid <- info %>% select(name, group, culture)
+info_ovarioid$batch <- rep("NovaSeq6000", nrow(info_ovarioid))
+info_ovarioid$type <- rep("TGP", nrow(info_ovarioid))
+
+info_all <- rbind(info_iva, info_ovarioid)
+print(all(info_all$name == colnames(all)))
+
+# create dds object
+dds_all <- DESeqDataSetFromMatrix(countData = all, colData = info_all, design = ~ culture)
+
+# remove low expressed genes
+keep <- rowSums(counts(dds_all) > 1) >= 5
+dds_all <- dds_all[keep,]
+
+vsd <- vst(dds_all, blind=FALSE)
+mat <- assay(vsd)
+mm <- model.matrix(~culture, colData(vsd))
+mat <- limma::removeBatchEffect(mat, batch=vsd$batch, design=mm)
+assay(vsd) <- mat
+
+#modcombat <- model.matrix(~batch, data = info_all)
+#dds2 <- sva::ComBat(dat = all, batch = info_all$batch, mod = modcombat)
+
+pca <- plotPCA(vsd, intgroup=c("batch"), returnData = T) 
+df <- merge(pca, info_all, by.x = "name", by.y = "name")
+percentVar <- round(100 * attr(pca, "percentVar")) 
+ggplot(df, aes(PC1, PC2, color=culture)) + 
+      ggtitle(paste0("PCA (vst)")) + theme +
+      geom_point(size = 3) + 
+      xlab(paste0("PC1: ", percentVar[1], "% variance")) + 
+      ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  stat_ellipse(aes(PC1, PC2, color = culture))
+
+```
+
+
+## Plot individual genes
+
+```{r individual gene plotting}
+
+col1a1 <- plotCounts(dataset[["dds_Medulla"]], gene= "ENSG00000108821", intgroup=c("freezing", "culture"), normalized = T,
+                  returnData=TRUE) 
+col1a1$gene <- rep("COL1A1", nrow(col1a1))
+
+lama1 <- plotCounts(dataset[["dds_Medulla"]], gene= "ENSG00000101680", intgroup=c("freezing", "culture"), normalized = T,
+                  returnData=TRUE) 
+lama1$gene <- rep("LAMA1", nrow(lama1))
+
+d7 <- rbind(col1a1, lama1)
+d7$culture <- factor(d7$culture, levels = c("Tissue", "2D", "3D"))
+
+ggplot(d7, aes(x=culture, y=count, fill = culture)) + 
+    geom_boxplot() + facet_wrap(~gene, scales = "free_y") +
+    xlab("") + ylab("normalized count") +
+    theme_bw() + 
+    scale_fill_manual(values=c("#f0f0f0", "#b3cde3", "orange"))
+
+```
+
+## Hypoxia genes in IVA dataset
+
+```{r IVA dataset hypoxia}
+
+read_excel_allsheets <- function(filename, tibble = FALSE) {
+    sheets <- readxl::excel_sheets(filename)
+    x <- lapply(sheets, function(X) readxl::read_excel(filename, sheet = X))
+    if(!tibble) x <- lapply(x, as.data.frame)
+    names(x) <- sheets
+    x
+}
+
+kgn <- read_excel_allsheets("/Users/tianyili/Desktop/Ovarioid/results/hypoxia_genes.xlsx")
+hypoxia <- kgn[[1]]
+
+dds <- DESeqDataSetFromMatrix(countData = iva_bulk, colData = iva_info, design = ~cultures)
+keep <- rowSums(counts(dds) > 1) >= 7
+dds <- dds[keep,]
+dds <- DESeq(dds)
+
+normalized_counts <- counts(dds, normalized=T) %>% 
+  data.frame() %>%
+  tibble::rownames_to_column(var="gene") %>%
+  as_tibble() %>%
+  left_join(output, by=c("gene" = "ensembl_gene_id")) 
+
+# Cortex hypoxia
+df <- normalized_counts
+id_c <- match(hypoxia$gene, df$external_gene_name) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- iva_info
+
+anno <- d2[, c(1, 6)]
+rownames(anno) <- anno$Sample
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = T, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Fresh")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$Sample)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "Cultured")
+frag <- scalecor[,which(colnames(scalecor) %in% d5$Sample)]
+fragg <- apply(frag, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(frag)) %>% 
+  'colnames<-' ("Fragmentation")
+
+cortex <- cbind(tiss, fragg)
+
+anno_group <- colnames(cortex) %>% as.data.frame()
+colnames(anno_group) <- "group"
+
+Heatmap(as.matrix(cortex), name = "Z-score",
+        #cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_km = 2,
+        #row_gap = unit(2, "mm"),
+        show_row_names = T,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+```
+
+## IVA angiogenesis heatmap
+
+```{r IVA angiogenesis}
+
+# Cortex angiogenesis
+
+angiogenesis <- bitr("GO:0001525", fromType = "GO", toType = "SYMBOL", OrgDb = org.Hs.eg.db)
+angio <- angiogenesis$SYMBOL
+
+df <- normalized_counts
+id_c <- match(angio, df$external_gene_name) %>% na.omit()
+d1 <- df[id_c,] 
+d1 <- na.omit(d1)
+d1 <- d1[!duplicated(d1$external_gene_name),]
+
+genes_c <- d1[,(ncol(d1)-2)]
+
+scalecor <- scale(t(d1[,2:(ncol(d1)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame() %>% cbind(., genes_c) %>% 
+  na.omit()
+rownames(scalecor) <- scalecor$external_gene_name
+
+d2 <- iva_info
+
+anno <- d2[, c(1, 6)]
+rownames(anno) <- anno$Sample
+
+pheatmap(scalecor[, -ncol(scalecor)], cluster_rows = T, show_rownames = T, 
+         cluster_cols = T, clustering_distance_rows = "correlation", annotation = anno, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-1, 1, length.out = 90))
+
+d4 <- anno %>% filter(culture == "Fresh")
+tis <- scalecor[,which(colnames(scalecor) %in% d4$Sample)]
+tiss <- apply(tis, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(tis)) %>% 
+  'colnames<-' ("Tissue")
+
+d5 <- anno %>% filter(culture == "Cultured")
+frag <- scalecor[,which(colnames(scalecor) %in% d5$Sample)]
+fragg <- apply(frag, 1, mean) %>% as.data.frame() %>% 
+  'rownames<-' (rownames(frag)) %>% 
+  'colnames<-' ("Fragmentation")
+
+cortex <- cbind(tiss, fragg)
+
+anno_group <- colnames(cortex) %>% as.data.frame()
+colnames(anno_group) <- "group"
+
+Heatmap(as.matrix(cortex), name = "Z-score",
+        #cluster_row_slices = T,
+        cluster_columns = F,
+        clustering_distance_rows = "euclidean",
+        row_km = 2,
+        #row_gap = unit(2, "mm"),
+        show_row_names = T,
+        column_split = anno_group$group,
+        color = colorRampPalette(c("blue", "white", "red"))(100))
+
+
+```
+
+## IVA - Density plot for all genes
+
+```{r IVA density plot}
+
+# get normalized count matrix for all expressed genes
+cortex <- normalized_counts
+scalecor <- scale(t(cortex[,2:(ncol(cortex)-3)]), scale = T, center = T) %>% t() %>% 
+  as.data.frame()
+
+d2 <- iva_info
+
+# Add up each column to get more row
+temp5 <- scalecor[,1] %>% as.data.frame()
+temp5$sample <- rep(colnames(scalecor[1]), nrow(temp5))
+
+for (i in 2:ncol(scalecor)) {
+  temp6 <- scalecor[,i] %>% as.data.frame()
+  temp6$sample <- rep(colnames(scalecor[i]), nrow(temp6))
+  temp5 <- rbind(temp5, temp6)
+}
+
+# Add the group information to the data frame
+temp5$group <- NA
+for (i in unique(temp5$sample)) {
+  group <- d2[which(d2$Sample == i), which(colnames(d2) == "culture")]
+  temp5[which(temp5$sample == i),3] <- rep(group, length(which(temp5$sample == i)))
+}
+
+ggplot(temp5, aes(x = ., col = group)) + geom_density() + theme_bw() +
+  ggtitle("Density plot - IVA") + xlab("Z-score")
+
+```
+
+## DE analysis between tissue cortex and medulla
+
+```{r DE analysis cortex medulla}
+
+cor_info <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+cor_cells <- read.delim("/Users/tianyili/Desktop/Ovarioid/data/processed/cells_Cortex.csv", sep = ",")
+cor_cells <- re_name(cor_cells)
+print(all(cor_info$name == colnames(cor_cells)))
+
+med_info <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Medulla.csv", sep = ";")
+med_cells <- read.delim("/Users/tianyili/Desktop/Ovarioid/data/processed/cells_Medulla.csv", sep = ",")
+med_cells <- re_name(med_cells)
+print(all(med_info$name == colnames(med_cells)))
+
+al <- cbind(cor_cells, med_cells)
+al_info <- rbind(cor_info, med_info)
+al_info <- al_info %>% filter(culture == "Tissue")
+al <- re_order(al_info, al)
+
+dds <- DESeqDataSetFromMatrix(countData=al, colData = al_info, design = ~ type)
+keep <- rowSums(counts(dds) > 1) >= 5
+dds <- dds[keep,]
+
+dds <- DESeq(dds)
+
+comALL <- results(dds, contrast = c("type", "Medulla", "Cortex"), 
+                                    independentFiltering = T, pAdjustMethod = "fdr") %>% 
+                                    as.data.frame() %>% 
+                                    mutate(geneid = rownames(.))
+com05 <- comALL %>% filter(padj < 0.05)
+
+final05 <- get_id(com05)
+finalALL <- get_id(comALL)
+
+openxlsx::write.xlsx(final05, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_cortex_vs_medulla_FDR_0.05.xlsx")
+
+edo <- enrichGO(gene = final05$entrezgene_id,
+                universe = finalALL$entrezgene_id,
+                OrgDb = org.Hs.eg.db, ont = "ALL", 
+                pAdjustMethod = "BH", 
+                pvalueCutoff = 0.05, readable = TRUE)
+edo <- setReadable(edo, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+res <- edo@result %>% arrange(p.adjust)
+
+openxlsx::write.xlsx(res, file = "/Users/tianyili/Desktop/Ovarioid/results/tables/DESeq2_cortex_vs_medulla_enrichGO_FDR_0.05.xlsx")
+
+```
+
+
+## Session info
+
+```{r session info}
+
+sessionInfo()
+
+```
+
