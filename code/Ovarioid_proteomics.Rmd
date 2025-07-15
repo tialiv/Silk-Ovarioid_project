@@ -41,8 +41,8 @@ library(tidyverse)
 
 ```{r import data, echo=FALSE}
 
-tissue <- read_excel("/Users/tianyili/Desktop/Ovarioid/data/proteomics/20230929_HF2_01_AS1_Valentina_tissue_TMT6.xlsx")
-bso <- read_excel("/Users/tianyili/Desktop/Ovarioid/data/proteomics/20230929_HF2_02_AS1_Valentina_BSO_TMT6.xlsx")
+tissue <- read_excel("/Users/tili/Desktop/PhD/Ovarioid/data/proteomics/20230929_HF2_01_AS1_Valentina_tissue_TMT6.xlsx")
+bso <- read_excel("/Users/tili/Desktop/PhD/Ovarioid/data/proteomics/20230929_HF2_02_AS1_Valentina_BSO_TMT6.xlsx")
 
 tis <- tissue[, c(24, 26, 36:41)]
 so <- bso[, c(24, 26, 36:41)]
@@ -240,7 +240,7 @@ cortex <- merge(angio_cortex, cort_df, by.x = "Gene", by.y = "external_gene_name
 cortex <- cortex[, -c(7,22:23)]
 
 # Read the metadata and keep only the samples that match the proteomics
-info <- read.csv("/Users/tianyili/Desktop/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
+info <- read.csv("/Users/tili/Desktop/PhD/Ovarioid/data/processed/info_Cortex.csv", sep = ";")
 info_cor <- info %>% select(name, culture) %>% 
   filter(culture != "2D")
 info_cor[11:15,1] <- colnames(angio_cortex)[2:6]
@@ -531,7 +531,7 @@ cor <- cor[,-ncol(cor)]
 
 d1 <- cor %>% filter(Gene %in% c("COL1A1", "LAMA1")) 
 
-d1 <- d1 %>% select(!WikiPathways.x) %>% 
+d1 <- d1 %>% dplyr::select(!WikiPathways.x) %>% 
   pivot_longer(!Gene, names_to = "Sample", values_to = "value")
 d1$culture <- c(rep("Tissue", 3), rep("Silk-Ov", 2))
 d1$culture <- factor(d1$culture, levels = c("Tissue", "Silk-Ov"))
@@ -541,15 +541,14 @@ ggplot(d1, aes(x = culture, y = value)) + geom_boxplot() + theme_bw() +
   ggtitle("COL1A1") + ylab("Normalized Protein Contribution") + xlab("")
 
 ## Medulla
-
 d2 <- med %>% filter(Gene %in% c("COL1A1", "LAMA1")) 
 
-d2 <- d2 %>% select(!WikiPathways.x) %>% 
+d2 <- d2 %>% dplyr::select(!WikiPathways.x) %>% 
   pivot_longer(!Gene, names_to = "Sample", values_to = "value")
 d2$culture <- c(rep("Tissue", 3), rep("Silk-Ov", 3))
 d2$culture <- factor(d2$culture, levels = c("Tissue", "Silk-Ov"))
 
-ggplot(d2, aes(x = culture, y = value)) + geom_boxplot() + theme_bw() +
+ggplot(d2, aes(x = culture, y = value)) + geom_boxplot() + theme_bw() + geom_point() +
   ggtitle("COL1A1") + ylab("Normalized Protein Contribution") + xlab("")
 
 ```
