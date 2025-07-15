@@ -5,7 +5,7 @@ Characterization of 2D and Silk-Ovarioid samples derived from primary ovarian ce
 
 #### 1. Mapping and alignment
 
-Mapping and alignment were performed using **Snakefile1.smk** together with **config.yaml** file which contains the configuration for the mapping and alignment.
+Mapping and alignment were performed using **Snakefile1.txt** together with **config.yaml** file which contains the configuration for the mapping and alignment.
 
 #### 2. Downstream analysis
 
